@@ -197,7 +197,7 @@ def convert_svg_to_png(svg_path, png_path):
             output_width=quality, output_height=quality);
 
 def convert_svgs_to_pngs(working_dir):
-    for file in list_files(working_dir, '.*\.svg'):
+    for file in list_files(working_dir, r'.*\.svg'):
         file = os.path.join(working_dir, file[:-4]);
         convert_svg_to_png(file + '.svg', file + '.png');
 
@@ -340,7 +340,7 @@ def draw_character_row(working_dir, canvas, character_info, y, guide): #TODO: re
     character = character_info.character;
     stroke_y = y - TEXT_PADDING - pinyin_h - TEXT_PADDING - STROKE_SIZE;
     stroke_x = pinyin_x;
-    stroke_order = sorted(list_files(working_dir, character + '.*\.png'))[2:];
+    stroke_order = sorted(list_files(working_dir, character + r'.*\.png'))[2:];
     stroke_order = [x[1:-4] for x in stroke_order];
     stroke_order = sorted([int(x) for x in stroke_order]); # sort numerically
     stroke_order = shorten_stroke_order(stroke_order, MAX_STROKES);
@@ -534,6 +534,7 @@ def get_spanning_translations(characters, words):
     return spanning_translations;
 
 def generate_sheet(makemeahanzi_path, working_dir, title, guide, stroke_order_color):
+    global FONT_NAME
     if len(title) > MAX_TITLE_LENGTH:
         raise GenException('Title length exceeded (' + str(len(title)) + \
                 '/' + str(MAX_TITLE_LENGTH) + ')');
@@ -547,7 +548,11 @@ def generate_sheet(makemeahanzi_path, working_dir, title, guide, stroke_order_co
     words = filter_out_words_with_empty_definition(words);
 
     c = canvas.Canvas(os.path.join(working_dir, SHEET_FILE), PAGE_SIZE);
-    pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_NAME + '.ttf'));
+    try:
+        pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_NAME + '.ttf'));
+    except Exception:
+        # Fallback if font file missing; use built-in Helvetica
+        FONT_NAME = 'Helvetica'
 
     words_with_spanning_translation = get_spanning_translations( \
                                         character_infos, words);
@@ -573,8 +578,8 @@ def generate_sheet(makemeahanzi_path, working_dir, title, guide, stroke_order_co
         convert_svgs_to_pngs(working_dir);
         y = FIRST_CHARACTER_ROW_Y-i_mod*CHARACTER_ROW_HEIGHT;
         draw_character_row(working_dir, c, info, y, guide);
-        delete_files(working_dir, '.*\.svg');
-        delete_files(working_dir, '.*\.png');
+        delete_files(working_dir, r'.*\.svg');
+        delete_files(working_dir, r'.*\.png');
     
     y = PAGE_SIZE[1]-HEADER_PADDING-GRID_OFFSET/2 - \
         (CHARACTERS_PER_PAGE-1)*CHARACTER_ROW_HEIGHT;
@@ -653,8 +658,8 @@ def main(argv):
         if info_mode == sheet_mode:
             generate_infos(makemeahanzi, cedict, working_dir, characters);
             generate_sheet(makemeahanzi, working_dir, title, guide_val, stroke_order_color);
-            delete_files(working_dir, CHARACTERS_FILE.replace('.', '\.'));
-            delete_files(working_dir, WORDS_FILE.replace('.', '\.'));
+            delete_files(working_dir, CHARACTERS_FILE.replace('.', r'\.'));
+            delete_files(working_dir, WORDS_FILE.replace('.', r'\.'));
         elif info_mode:
             generate_infos(makemeahanzi, cedict, working_dir, characters);
         else:
