@@ -22,7 +22,7 @@ import sqlite3
 import sys
 import tempfile
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import re
 from typing import Any, Dict, List
@@ -141,202 +141,310 @@ def _clean_front(text: str) -> str:
     return cleaned
 
 
+def _ts_to_dt(ts: int | float | None) -> datetime | None:
+    """Convert a Pleco timestamp (seconds or ms) to datetime."""
+    if not isinstance(ts, (int, float)) or ts <= 0:
+        return None
+    # Heuristic: milliseconds if very large
+    if ts >= 10**12:
+        ts /= 1000.0
+    try:
+        return datetime.fromtimestamp(ts)
+    except OSError:
+        return None
+
+
+def _safe_div(a: float, b: float) -> float:
+    return a / b if b else 0.0
+
+
+def _compute_predicted_interval_hours(row: dict) -> float:
+    """
+    Derive a 'predicted interval' (hours) using:
+      - base interval from (last - first)/(reviews - 1)
+      - growth factor from score, difficulty, accuracy
+    Falls back to modest default if insufficient history.
+    """
+    first_dt = _ts_to_dt(row.get("firstreviewedtime"))
+    last_dt = _ts_to_dt(row.get("lastreviewedtime"))
+    reviewed = row.get("reviewed", 0) or 0
+    score = row.get("score", 0) or 0
+    difficulty = row.get("difficulty", 0) or 0
+    correct = row.get("correct", 0) or 0
+    incorrect = row.get("incorrect", 0) or 0
+    accuracy = _safe_div(correct, (correct + incorrect)) if (correct + incorrect) > 0 else 0.75
+
+    # Base interval (hours)
+    if first_dt and last_dt and reviewed and reviewed > 1 and last_dt > first_dt:
+        total_span_hours = (last_dt - first_dt).total_seconds() / 3600.0
+        base_interval = total_span_hours / (reviewed - 1)
+        # Clamp unreasonable low/high
+        base_interval = max(0.25, min(base_interval, 24 * 30))
+    else:
+        # Fallback base proportional to score
+        base_interval = 4.0 + (score / 100.0) * 12.0  # 4h .. ~16h typical
+
+    # Growth factors
+    score_factor = 1.0 + min(score, 300) / 300.0          # up to 2.0
+    difficulty_factor = 1.0 / (1.0 + 0.7 * max(difficulty, 0))  # harder -> shorter
+    accuracy_factor = max(0.6, min(accuracy * 1.1, 1.25))       # 0.6 .. 1.25
+
+    predicted = base_interval * score_factor * difficulty_factor * accuracy_factor
+    # Global clamps
+    predicted = max(0.25, min(predicted, 24 * 60))  # 15 min .. 60 days
+    return predicted
+
+
+def _compute_priority(row: dict) -> dict:
+    """
+    Compute spaced-repetition priority.
+    Returns dict of metrics appended to row:
+      priority, predicted_interval_hours, elapsed_hours, overdue_ratio, accuracy, error_rate, volatility
+    """
+    last_dt = _ts_to_dt(row.get("lastreviewedtime"))
+    first_dt = _ts_to_dt(row.get("firstreviewedtime"))
+    now = datetime.now()
+
+    score = row.get("score", 0) or 0
+    difficulty = row.get("difficulty", 0) or 0
+    correct = row.get("correct", 0) or 0
+    incorrect = row.get("incorrect", 0) or 0
+    reviewed = row.get("reviewed", 0) or 0
+    scoreinctime = row.get("scoreinctime")
+    scoredectime = row.get("scoredectime")
+
+    accuracy = _safe_div(correct, (correct + incorrect)) if (correct + incorrect) > 0 else 0.75
+    error_rate = _safe_div(incorrect, (correct + incorrect)) if (correct + incorrect) > 0 else 0.0
+
+    predicted_hours = _compute_predicted_interval_hours(row)
+
+    elapsed_hours = _safe_div((now - last_dt).total_seconds(), 3600.0) if last_dt else 0.0
+    overdue_ratio = max(0.0, _safe_div((elapsed_hours - predicted_hours), predicted_hours))
+
+    # Volatility heuristic
+    v = 0.2
+    if scoredectime and scoreinctime and scoredectime > scoreinctime:
+        v = 1.0
+    elif scoreinctime and (not scoredectime or scoreinctime > scoredectime):
+        # recent increase => medium volatility
+        v = 0.5
+
+    # Recency penalty for very new cards
+    recency_penalty = 0.0
+    if first_dt:
+        age_hours = _safe_div((now - first_dt).total_seconds(), 3600.0)
+        if age_hours < 12 and reviewed < 3:
+            recency_penalty = (12 - age_hours) / 12.0  # fades to 0 over first 12h
+
+    # Normalized difficulty
+    difficulty_norm = difficulty / (difficulty + 3.0) if difficulty >= 0 else 0.0
+
+    # Weight tuning (initial)
+    w1, w2, w3, w4, w5, w6 = 0.45, 0.15, 0.15, 0.10, 0.10, 0.05
+    priority = (
+        w1 * overdue_ratio +
+        w2 * v +
+        w3 * error_rate +
+        w4 * difficulty_norm +
+        w5 * (1.0 - accuracy) +
+        w6 * recency_penalty
+    )
+
+    # Add metrics to row
+    row["priority"] = round(priority, 6)
+    row["predicted_interval_hours"] = round(predicted_hours, 3)
+    row["elapsed_hours"] = round(elapsed_hours, 3)
+    row["overdue_ratio"] = round(overdue_ratio, 3)
+    row["accuracy"] = round(accuracy, 3)
+    row["error_rate"] = round(error_rate, 3)
+    row["volatility"] = v
+    return row
+
+
 def query_top_due(db_path: str, limit: int) -> List[Dict[str, Any]]:
     """
-    Return a list of dicts:
-        {'id': int, 'due': datetime|None, 'front': str, 'data': dict}
+    Advanced version:
+      - For Pleco: derive priority from score/difficulty/timing metrics.
+      - For Anki-like: still uses c.due if available, but also computes priority via elapsed/score proxy.
+      Returns list of rows with added SRS metrics.
     """
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # 1) Try Anki-like schema first
-    try:
-        sql = (
-            "SELECT c.id, c.due, n.sfld AS front, n.data "
-            "FROM cards c JOIN notes n ON c.nid = n.id "
-            "WHERE c.queue != -1 ORDER BY c.due ASC LIMIT ?"
-        )
-        cur.execute(sql, (limit,))
-        rows = cur.fetchall()
-        model = "anki"
-    except sqlite3.Error:
-        rows = None
-        model = None
+    rows = []
+    model = None
 
-    # 2) If not Anki, try Pleco schema
-    if rows is None:
-        # Find scores table like 'pleco_flash_scores_%' (choose the one with most rows)
+    # Try Anki-like first
+    try:
+        cur.execute(
+            "SELECT c.id, c.due, n.sfld AS front, n.data, 0 AS score, 0 AS difficulty, 0 AS correct, 0 AS incorrect, 0 AS reviewed, 0 AS firstreviewedtime, c.due AS lastreviewedtime, 0 AS scoreinctime, 0 AS scoredectime "
+            "FROM cards c JOIN notes n ON c.nid = n.id "
+            "WHERE c.queue != -1 LIMIT ?", (limit * 5,)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        if rows:
+            model = "anki"
+    except sqlite3.Error:
+        rows = []
+
+    if not rows:
+        # Pleco path
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'pleco_flash_scores_%'")
         score_tables = [r[0] for r in cur.fetchall()]
         if not score_tables:
-            # Provide schema list for debugging
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tbls = [r[0] for r in cur.fetchall()]
             conn.close()
-            raise RuntimeError(
-                "Unsupported DB schema (no pleco scores table found). Tables: " + ", ".join(tbls)
-            )
+            raise RuntimeError("No Pleco scores table found.")
 
-        # Pick the table with most rows
-        table_counts = []
+        # Choose largest
+        best_table = None
+        best_count = -1
         for t in score_tables:
             try:
                 cur.execute(f"SELECT COUNT(1) FROM {t}")
                 cnt = cur.fetchone()[0]
+                if cnt > best_count:
+                    best_count = cnt
+                    best_table = t
             except sqlite3.Error:
-                cnt = 0
-            table_counts.append((cnt, t))
-        table_counts.sort(reverse=True)
-        scores_table = table_counts[0][1]
+                pass
 
-        # Inspect columns to guess due + card id
-        def columns(table):
-            cur.execute(f"PRAGMA table_info({table})")
-            return [r[1] for r in cur.fetchall()]
+        if not best_table:
+            conn.close()
+            raise RuntimeError("Unable to select Pleco scores table.")
 
-        score_cols = columns(scores_table)
+        # Load raw score rows
+        cur.execute(f"PRAGMA table_info({best_table})")
+        score_cols = [c[1] for c in cur.fetchall()]
 
-        # Candidate due column names (case-insensitive)
-        due_candidates = [
-            "nextreview", "next_review", "next", "due", "nextdue", "reviewtime", "nextr"
-        ]
-        due_col = next((c for c in score_cols if c.lower() in due_candidates), None)
-        if due_col is None:
-            # fallback: any column containing 'due' or 'next'
-            due_col = next((c for c in score_cols if re.search(r"(due|next)", c, re.I)), None)
-        if due_col is None:
-            # Fallback: use lastreviewedtime as proxy for due (older => more due)
-            if "lastreviewedtime" in (c.lower() for c in score_cols):
-                due_col = next(c for c in score_cols if c.lower() == "lastreviewedtime")
-            elif "firstreviewedtime" in (c.lower() for c in score_cols):
-                due_col = next(c for c in score_cols if c.lower() == "firstreviewedtime")
-            else:
-                conn.close()
-                raise RuntimeError(
-                    f"Could not determine a due-like column in {scores_table}. Columns: {', '.join(score_cols)}"
-                )
+        # Card id column
+        id_col = next((c for c in score_cols if c.lower() in ("cardid", "card", "cid", "id")), score_cols[0])
 
-        # Candidate card id column names
-        card_candidates = ["cardid", "card", "cid", "id"]
-        card_col = next((c for c in score_cols if c.lower() in card_candidates), None)
-        if card_col is None:
-            # heuristic: first INTEGER primary key-like column
-            cur.execute(f"PRAGMA table_info({scores_table})")
-            rows_info = cur.fetchall()
-            pk_cols = [r for r in rows_info if r[5] == 1]
-            card_col = pk_cols[0][1] if pk_cols else score_cols[0]
+        cur.execute(f"SELECT * FROM {best_table}")
+        raw_scores = [dict(r) for r in cur.fetchall()]
 
-        # Fetch top due cards from scores table
-        # Order so that rows with a real timestamp come first and are earliest due
-        cur.execute(
-            (
-                f"SELECT {card_col} AS card_id, {due_col} AS due FROM {scores_table} "
-                f"ORDER BY CASE WHEN {due_col} IS NULL OR {due_col}<=0 THEN 1 ELSE 0 END, {due_col} ASC LIMIT ?"
-            ),
-            (limit,)
-        )
-        score_rows = cur.fetchall()
-
-        # Try to resolve front text from pleco_flash_cards
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pleco_flash_cards'")
-        has_cards = cur.fetchone() is not None
+        # Load front texts
         fronts = {}
-        if has_cards and score_rows:
-            cards_cols = columns("pleco_flash_cards")
-            # plausible text columns, choose the first available
-            text_candidates = [
-                "text", "head", "hw", "word", "entry", "front", "question", "chars", "hanzi", "headword"
-            ]
-            text_col = next((c for c in cards_cols if c.lower() in text_candidates), None)
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pleco_flash_cards'")
+        if cur.fetchone():
+            cur.execute("PRAGMA table_info(pleco_flash_cards)")
+            card_cols = [c[1] for c in cur.fetchall()]
+            text_col = next((c for c in card_cols if c.lower() in (
+                "text", "head", "hw", "word", "entry", "front", "question", "chars", "hanzi", "headword")), None)
+            id2_col = next((c for c in card_cols if c.lower() in ("id", "cardid", "cid", "card")), None)
+            if text_col and id2_col:
+                ids = tuple({row[id_col] for row in raw_scores})
+                if ids:
+                    placeholders = ",".join(["?"] * len(ids))
+                    cur.execute(f"SELECT {id2_col} AS id, {text_col} AS front FROM pleco_flash_cards WHERE {id2_col} IN ({placeholders})", ids)
+                    for rr in cur.fetchall():
+                        fronts[rr["id"]] = rr["front"]
 
-            # find id column in cards table
-            id_candidates = ["id", "cardid", "cid", "card"]
-            id_col = next((c for c in cards_cols if c.lower() in id_candidates), None)
-
-            if text_col and id_col:
-                ids = tuple({r["card_id"] for r in score_rows})
-                placeholder = ",".join(["?"] * len(ids)) if ids else "?"
-                cur.execute(
-                    f"SELECT {id_col} AS id, {text_col} AS front FROM pleco_flash_cards WHERE {id_col} IN (" + placeholder + ")",
-                    tuple(ids) if ids else (None,)
-                )
-                for rr in cur.fetchall():
-                    fronts[rr["id"]] = rr["front"]
-
-        # Build unified rows structure like the Anki branch
-        rows = []
-        for r in score_rows:
-            rows.append({
-                "id": r["card_id"],
-                "due": r["due"],
-                "front": fronts.get(r["card_id"], ""),
-                "data": {}
-            })
+        # Build uniform rows
+        for r in raw_scores:
+            rid = r.get(id_col)
+            r_out = {
+                "id": rid,
+                "front": fronts.get(rid, ""),
+                # Carry raw timing/performance fields
+                "score": r.get("score", 0),
+                "difficulty": r.get("difficulty", 0),
+                "correct": r.get("correct", 0),
+                "incorrect": r.get("incorrect", 0),
+                "reviewed": r.get("reviewed", 0),
+                "firstreviewedtime": r.get("firstreviewedtime", 0),
+                "lastreviewedtime": r.get("lastreviewedtime", 0),
+                "scoreinctime": r.get("scoreinctime", 0),
+                "scoredectime": r.get("scoredectime", 0),
+            }
+            rows.append(r_out)
         model = "pleco"
 
     conn.close()
 
-    result = []
+    # Compute metrics / priority
+    enriched = []
+    now = datetime.now()
     for r in rows:
-        due_val = r["due"]
-        # Convert due to datetime; detect unit (ms vs sec)
-        due_dt = None
-        if isinstance(due_val, (int, float)) and due_val > 0:
-            # Heuristic: >= 10^12 implies ms
-            if due_val >= 10**12:
-                due_dt = datetime.fromtimestamp(due_val / 1000.0)
-            else:
-                due_dt = datetime.fromtimestamp(due_val)
+        # For Anki: treat 'due' original as numeric; convert lastreviewed fallback
+        if model == "anki":
+            due_raw = r.get("due")
+            due_dt = None
+            if isinstance(due_raw, (int, float)) and due_raw > 0:
+                if due_raw >= 10**12:
+                    due_dt = datetime.fromtimestamp(due_raw / 1000.0)
+                else:
+                    due_dt = datetime.fromtimestamp(due_raw)
+            r["lastreviewedtime"] = due_raw  # approximate
+        enriched.append(_compute_priority(r))
 
-        data_json = {}
-        if "data" in r.keys():
-            try:
-                data_json = json.loads(r["data"]) if isinstance(r["data"], str) else {}
-            except json.JSONDecodeError:
-                data_json = {}
+    # Sort by priority (desc), tie-break by elapsed_hours then lower score
+    enriched.sort(key=lambda x: (x["priority"],
+                                 x.get("elapsed_hours", 0),
+                                 -x.get("score", 0)), reverse=True)
 
+    # Limit
+    top = enriched[:limit]
+
+    # Compute a synthetic next-review datetime (predicted due) for display
+    result = []
+    for r in top:
+        last_dt = _ts_to_dt(r.get("lastreviewedtime"))
+        predicted_interval_hours = r["predicted_interval_hours"]
+        due_dt = last_dt + timedelta(hours=predicted_interval_hours) if last_dt else None
         result.append({
             "id": r["id"],
-            "due": due_dt,
             "front": r.get("front", ""),
-            "data": data_json,
+            "due": due_dt,
+            "due_sort": due_dt,
+            # Expose metrics for CSV/log if desired
+            "priority": r["priority"],
+            "predicted_interval_hours": r["predicted_interval_hours"],
+            "elapsed_hours": r["elapsed_hours"],
+            "overdue_ratio": r["overdue_ratio"],
+            "accuracy": r["accuracy"],
+            "difficulty": r.get("difficulty", 0),
+            "score": r.get("score", 0),
         })
-    # Ensure dict keys include 'front' and a sortable 'due_sort'
-    for r in result:
-        if 'front' not in r:
-            r['front'] = ''
-        # unify due field
-        if 'due_sort' not in r and 'due' in r:
-            r['due_sort'] = r['due']
     return result
 
 
+# Adjust pretty_print to show priority and predicted interval
 def pretty_print(cards):
-    print("\nTop due cards".center(60, "="))
-    header = f"{'#':>3}  {'Due':19}  {'Front'}"
+    print("\nTop due cards (advanced SRS)".center(85, "="))
+    header = f"{'#':>3}  {'Next (est)':19}  {'Pri':>6}  {'PredInt(h)':>9}  {'Acc':>5}  {'Front'}"
     print(header)
     print("-" * len(header))
     for i, c in enumerate(cards, 1):
-        due_str = c["due"].strftime("%Y-%m-%d %H:%M") if c["due"] else "New"
-        print(f"{i:>3}  {due_str:19}  {_clean_front(c['front'])}")
-    print("=" * 60)
+        due_str = c["due"].strftime("%Y-%m-%d %H:%M") if c["due"] else "—"
+        print(f"{i:>3}  {due_str:19}  {c['priority']:6.3f}  {c['predicted_interval_hours']:9.2f}  {c['accuracy']:5.2f}  {_clean_front(c['front'])}")
+    print("=" * 85)
 
 
 def write_csv(cards: List[Dict[str, Any]], out_path: Path) -> None:
-    """CSV with just the fields you probably need. Skips cards with missing front."""
-    import csv
+    """CSV (skips missing fronts). Includes priority + metrics."""
     kept = 0
     with open(out_path, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
-        w.writerow(['#', 'Front', 'Due'])
+        w.writerow(['#', 'Front', 'NextReview', 'Priority', 'PredIntervalHours', 'ElapsedHours', 'Accuracy', 'Score', 'Difficulty'])
         for idx, c in enumerate(cards, start=1):
             raw_front = c.get('front', '') or ''
             front = _clean_front(raw_front)
-            if not raw_front or not front:  # skip missing
+            if not raw_front or not front:
                 continue
-            due = c.get('due_sort') or c.get('due') or ''
-            w.writerow([idx, front, due])
+            due = c.get('due')
+            due_str = due.strftime("%Y-%m-%d %H:%M") if isinstance(due, datetime) else ''
+            w.writerow([
+                idx,
+                front,
+                due_str,
+                c.get('priority', ''),
+                c.get('predicted_interval_hours', ''),
+                c.get('elapsed_hours', ''),
+                c.get('accuracy', ''),
+                c.get('score', ''),
+                c.get('difficulty', ''),
+            ])
             kept += 1
     print(f"CSV written to: {out_path} (rows kept: {kept})")
 
