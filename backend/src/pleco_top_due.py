@@ -323,22 +323,81 @@ def query_top_due(db_path: str, limit: int) -> List[Dict[str, Any]]:
         cur.execute(f"SELECT * FROM {best_table}")
         raw_scores = [dict(r) for r in cur.fetchall()]
 
-        # Load front texts
+        # Load front texts (prefer Traditional if available)
         fronts = {}
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pleco_flash_cards'")
         if cur.fetchone():
             cur.execute("PRAGMA table_info(pleco_flash_cards)")
-            card_cols = [c[1] for c in cur.fetchall()]
-            text_col = next((c for c in card_cols if c.lower() in (
-                "text", "head", "hw", "word", "entry", "front", "question", "chars", "hanzi", "headword")), None)
-            id2_col = next((c for c in card_cols if c.lower() in ("id", "cardid", "cid", "card")), None)
-            if text_col and id2_col:
-                ids = tuple({row[id_col] for row in raw_scores})
-                if ids:
-                    placeholders = ",".join(["?"] * len(ids))
-                    cur.execute(f"SELECT {id2_col} AS id, {text_col} AS front FROM pleco_flash_cards WHERE {id2_col} IN ({placeholders})", ids)
+            cols_info = cur.fetchall()
+            card_cols = [c[1] for c in cols_info]
+            lower_cols = {c.lower(): c for c in card_cols}
+
+            # Prefer likely Traditional columns first
+            trad_pref = ['althw']
+            simp_fallback = ['text', 'head', 'hw', 'word', 'entry', 'front', 'question', 'chars', 'hanzi', 'headword']
+            id_candidates = ['id', 'cardid', 'cid', 'card']
+            entry_fk_candidates = ['entryid', 'eid', 'dictentryid', 'dictionaryentryid', 'entry', 'wordid', 'headid']
+
+            id2_col = next((lower_cols[c] for c in id_candidates if c in lower_cols), None)
+            text_trad_col = next((lower_cols[c] for c in trad_pref if c in lower_cols), None)
+            text_simp_col = next((lower_cols[c] for c in simp_fallback if c in lower_cols), None)
+
+            ids = tuple({row[id_col] for row in raw_scores})
+            if id2_col and ids:
+                placeholders = ",".join(["?"] * len(ids))
+                # First try a Traditional column on the cards table
+                if text_trad_col:
+                    cur.execute(f"SELECT {id2_col} AS id, {text_trad_col} AS front FROM pleco_flash_cards WHERE {id2_col} IN ({placeholders})", ids)
                     for rr in cur.fetchall():
-                        fronts[rr["id"]] = rr["front"]
+                        if rr["front"]:
+                            fronts[rr["id"]] = rr["front"]
+                # Fallback to a general text column on the cards table
+                if not fronts and text_simp_col:
+                    cur.execute(f"SELECT {id2_col} AS id, {text_simp_col} AS front FROM pleco_flash_cards WHERE {id2_col} IN ({placeholders})", ids)
+                    for rr in cur.fetchall():
+                        if rr["front"]:
+                            fronts[rr["id"]] = rr["front"]
+
+                # If still missing, attempt to join to a dictionary table for Traditional headword
+                if len(fronts) < len(ids):
+                    entry_fk_col = next((lower_cols[c] for c in entry_fk_candidates if c in lower_cols), None)
+                    if entry_fk_col:
+                        # Collect the entry ids for our cards
+                        cur.execute(f"SELECT {id2_col} AS id, {entry_fk_col} AS entry_fk FROM pleco_flash_cards WHERE {id2_col} IN ({placeholders})", ids)
+                        card_entry_map = {r[0]: r[1] for r in cur.fetchall() if r[1] is not None}
+                        if card_entry_map:
+                            entry_ids = tuple(set(card_entry_map.values()))
+                            ph_e = ",".join(["?"] * len(entry_ids))
+                            # Scan for any plausible dictionary table with Traditional columns
+                            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                            all_tables = [r[0] for r in cur.fetchall()]
+                            dict_tables = [t for t in all_tables if t.lower().startswith('pleco_dict') or t.lower().startswith('pleco_dictionary')]
+                            for dt in dict_tables:
+                                try:
+                                    cur.execute(f"PRAGMA table_info({dt})")
+                                    dinfo = cur.fetchall()
+                                    dcols = [c[1] for c in dinfo]
+                                    dlower = {c.lower(): c for c in dcols}
+                                    d_id_col = next((dlower[c] for c in ['id', 'entryid', 'eid'] if c in dlower), None)
+                                    d_trad_col = next((dlower[c] for c in trad_pref if c in dlower), None)
+                                    d_simp_col = next((dlower[c] for c in simp_fallback if c in dlower), None)
+                                    if not d_id_col:
+                                        continue
+                                    target_text_col = d_trad_col or d_simp_col
+                                    if not target_text_col:
+                                        continue
+                                    cur.execute(f"SELECT {d_id_col} AS did, {target_text_col} AS txt FROM {dt} WHERE {d_id_col} IN ({ph_e})", entry_ids)
+                                    dict_rows = {r[0]: r[1] for r in cur.fetchall() if r[1]}
+                                    if dict_rows:
+                                        # backfill fronts
+                                        for cid, eid in card_entry_map.items():
+                                            if cid not in fronts and eid in dict_rows:
+                                                fronts[cid] = dict_rows[eid]
+                                        # Stop after first successful dictionary table
+                                        if len(fronts) == len(ids):
+                                            break
+                                except sqlite3.Error:
+                                    continue
 
         # Build uniform rows
         for r in raw_scores:
