@@ -10,8 +10,9 @@ class Result:
 # sep: string separating translations in definition
 # definition: list of translations (strings)
 def combine_and_shorten_definition(definition, sep, max_w, font_name, font_size):
-    if len(definition) == 0: # TODO!
-        raise GenException('Definition is too long and could not be shortened');
+    if len(definition) == 0:
+        # Return empty string for words with no definition rather than raising
+        return Result('', 0);
     text = sep.join(definition);
     w = stringWidth(text, font_name, font_size);
     if w <= max_w:
