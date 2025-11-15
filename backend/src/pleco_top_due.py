@@ -552,8 +552,8 @@ def main():
         "limit",
         nargs="?",
         type=int,
-        default=20,
-        help="How many cards to pull (default: 20)",
+        default=140,   # was 20
+        help="How many cards to pull (default: 140)",
     )
     parser.add_argument(
         "--run",
