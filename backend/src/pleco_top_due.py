@@ -678,7 +678,7 @@ def main():
         print(f"\nMissing fronts ({len(missing_ids)}): {missing_ids if missing_ids else 'None'}")
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = Path.cwd() / f"pleco_top{args.limit}_{timestamp}.csv"
+        csv_path = Path.cwd() / f"backend/data/pleco_top{args.limit}_{timestamp}.csv"
         write_csv(cards, csv_path)
 
         # Build worksheet sequence excluding missing
@@ -692,7 +692,7 @@ def main():
         print(f"\nWorksheet sequence (for generator):\n{sequence}\n")
 
         # Log file
-        log_path = Path.cwd() / f"pleco_top_due_log_{timestamp}.txt"
+        log_path = Path.cwd() / f"backend/data/pleco_top_due_log_{timestamp}.txt"
         log_run(log_path, latest_pqb, db_path, cards, missing_ids, csv_path, sequence)
 
         # ------------------------------------------------------------------- #
