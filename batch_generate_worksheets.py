@@ -46,7 +46,7 @@ def batch_list(lst, batch_size):
         yield lst[i:i+batch_size]
 
 
-def generate_worksheet(batch, batch_num, guide=None):
+def generate_worksheet(batch, batch_num, guide=None, stroke_order_color=None):
     chars = ''.join(batch)
     date_prefix = datetime.now().strftime('%Y%m%d')
     pdf_name = f'{date_prefix}_{worksheet_prefix}_{batch_num:02d}.pdf'
@@ -61,6 +61,8 @@ def generate_worksheet(batch, batch_num, guide=None):
     ]
     if guide:
         cmd += ['--guide', guide]
+    if stroke_order_color:
+        cmd += ['--stroke-order-color', stroke_order_color]
     
     print(f'Generating worksheet: {pdf_path} ({len(batch)} items)')
     subprocess.run(cmd, check=True)
@@ -73,7 +75,7 @@ def generate_worksheet(batch, batch_num, guide=None):
         print(f'Warning: sheet.pdf not found after generation')
 
 
-def main(batch_size=default_batch_size, guide=None):
+def main(batch_size=default_batch_size, guide=None, stroke_order_color=None):
     data_dir.mkdir(parents=True, exist_ok=True)
     csv_path = find_latest_csv()
     if not csv_path:
@@ -84,13 +86,14 @@ def main(batch_size=default_batch_size, guide=None):
         print('No valid fronts found in CSV.')
         sys.exit(1)
     for idx, batch in enumerate(batch_list(fronts, batch_size), 1):
-        generate_worksheet(batch, idx, guide=guide)
+        generate_worksheet(batch, idx, guide=guide, stroke_order_color=stroke_order_color)
     print('All worksheets generated.')
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Batch generate worksheets from Pleco CSV output.')
     parser.add_argument('--batch-size', type=int, default=default_batch_size, help='Number of items per worksheet (default: 15)')
-    parser.add_argument('--guide', type=str, default=None, help='Worksheet guide style (optional)')
+    parser.add_argument('--guide', type=str, default='cross_star', help='Worksheet guide style (default: cross_star)')
+    parser.add_argument('--stroke-order-color', type=str, default='red', help='Stroke order color (default: red)')
     args = parser.parse_args()
-    main(batch_size=args.batch_size, guide=args.guide)
+    main(batch_size=args.batch_size, guide=args.guide, stroke_order_color=args.stroke_order_color)

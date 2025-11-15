@@ -98,6 +98,29 @@ python cwg_gen.py --makemeahanzi .\makemeahanzi --title 'Vocabulary' --guide sta
 - `cross_star`: cross + star
 - `character`: faint character in practice squares
 
+## Pleco Integration (Automated Workflow)
+### Extract prioritized flashcards from Pleco backup
+```powershell
+python backend\src\pleco_top_due.py
+```
+This extracts the top 140 most-due cards from your latest Pleco backup (`.pqb` file) and saves them to `backend/data/pleco_top140_TIMESTAMP.csv`. The script uses an advanced SRS priority algorithm to rank cards based on difficulty, accuracy, overdue ratio, and volatility.
+
+### Generate batch worksheets from Pleco CSV
+```powershell
+python batch_generate_worksheets.py
+```
+This reads the latest CSV output from `pleco_top_due.py`, batches the characters into groups of 15 (configurable with `--batch-size`), and generates worksheet PDFs saved to your iCloud Drive (`D:\DaveApple\files\iCloudDrive\Mandarin\worksheets`). By default, worksheets use `cross_star` guide style and `red` stroke order color.
+
+Options:
+- `--batch-size N`: Number of items per worksheet (default: 15)
+- `--guide STYLE`: Worksheet guide style (default: cross_star; options: none, star, cross, cross_star, character)
+- `--stroke-order-color COLOR`: Stroke order color (default: red)
+
+Example:
+```powershell
+python batch_generate_worksheets.py --batch-size 20 --guide star --stroke-order-color black
+```
+
 ## Running tests
 ```
 pipenv install
