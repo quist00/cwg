@@ -324,22 +324,118 @@ def pretty_print(cards):
 
 
 def write_csv(cards: List[Dict[str, Any]], out_path: Path) -> None:
-    """CSV with just the fields you probably need."""
+    """CSV with just the fields you probably need. Skips cards with missing front."""
     import csv
+    kept = 0
     with open(out_path, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(['#', 'Front', 'Due'])
         for idx, c in enumerate(cards, start=1):
-            front = _clean_front(c.get('front', ''))
+            raw_front = c.get('front', '') or ''
+            front = _clean_front(raw_front)
+            if not raw_front or not front:  # skip missing
+                continue
             due = c.get('due_sort') or c.get('due') or ''
             w.writerow([idx, front, due])
-    print(f"CSV written to: {out_path}")
+            kept += 1
+    print(f"CSV written to: {out_path} (rows kept: {kept})")
 
 
 # Optional helper to print concatenated string for worksheet generator
 def print_compound_sequence(cards: List[Dict[str, Any]]) -> None:
-    seq = ''.join(_clean_front(c.get('front', '')) for c in cards)
-    print(f"\nWorksheet sequence:\n{seq}\n")
+    seq_parts = []
+    for c in cards:
+        raw_front = c.get('front', '') or ''
+        cleaned = _clean_front(raw_front)
+        if not raw_front or not cleaned:
+            continue
+        seq_parts.append(cleaned)
+    seq = ''.join(seq_parts)
+    print(f"\nWorksheet sequence (missing fronts omitted):\n{seq}\n")
+
+
+def log_run(log_path: Path,
+            backup_file: Path,
+            db_path: Path,
+            cards: List[Dict[str, Any]],
+            missing_ids: List[int],
+            csv_path: Path,
+            sequence: str) -> None:
+    lines = []
+    lines.append(f"Timestamp: {datetime.now().isoformat()}")
+    lines.append(f"Backup file: {backup_file}")
+    lines.append(f"DB path: {db_path}")
+    lines.append(f"Total cards queried: {len(cards)}")
+    lines.append(f"Missing front count: {len(missing_ids)}")
+    if missing_ids:
+        lines.append("Missing card IDs: " + ', '.join(map(str, missing_ids)))
+    lines.append(f"CSV path: {csv_path}")
+    lines.append(f"Worksheet sequence (truncated to 500 chars): {sequence[:500]}")
+    log_path.write_text('\n'.join(lines), encoding='utf-8')
+    print(f"Log written: {log_path}")
+
+
+def inspect_schema(db_path: Path, sample_rows: int = 0) -> None:
+    """Print SQLite tables, columns, row counts, and optional samples."""
+    def _quote_ident(name: str) -> str:
+        # Double up embedded " inside identifiers per SQL rules and wrap in "
+        return '"' + str(name).replace('"', '""') + '"'
+
+    conn = sqlite3.connect(str(db_path))
+    cur = conn.cursor()
+    cur.execute("select sqlite_version()")
+    ver = cur.fetchone()[0]
+    print(f"\nSQLite version: {ver}")
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+    tables = [r[0] for r in cur.fetchall()]
+    if not tables:
+        print("No tables found.")
+        conn.close()
+        return
+
+    for t in tables:
+        print(f"\nTable: {t}")
+        qt = _quote_ident(t)
+
+        # Columns
+        try:
+            cur.execute(f"PRAGMA table_info({qt})")
+            cols = cur.fetchall()
+            if cols:
+                print("  Columns:")
+                for cid, name, ctype, notnull, dflt, pk in cols:
+                    nn = " NOT NULL" if notnull else ""
+                    pkflag = " PK" if pk else ""
+                    dflt_str = f" DEFAULT {dflt}" if dflt is not None else ""
+                    print(f"    - {name} {ctype}{nn}{pkflag}{dflt_str}")
+            else:
+                print("  Columns: (none)")
+        except sqlite3.Error as e:
+            print(f"  (Error reading columns: {e})")
+
+        # Count
+        try:
+            cur.execute(f"SELECT COUNT(1) FROM {qt}")
+            cnt = cur.fetchone()[0]
+            print(f"  Rows: {cnt}")
+        except sqlite3.Error as e:
+            print(f"  (Error counting rows: {e})")
+            cnt = 0
+
+        # Sample rows
+        if sample_rows and cnt:
+            try:
+                cur.execute(f"PRAGMA table_info({qt})")
+                colnames = [r[1] for r in cur.fetchall()]
+                cur.execute(f"SELECT * FROM {qt} LIMIT ?", (sample_rows,))
+                rows = cur.fetchall()
+                print("  Sample:")
+                for r in rows:
+                    preview = {colnames[i]: r[i] for i in range(len(colnames))}
+                    print(f"    {preview}")
+            except sqlite3.Error as e:
+                print(f"  (Error sampling rows: {e})")
+    conn.close()
 
 
 def main():
@@ -369,6 +465,17 @@ def main():
             "(e.g. D\\DaveApple\\files\\iCloudDrive) or directly to the 'Flashcard Backups' folder."
         ),
     )
+    parser.add_argument(
+        "--inspect",
+        action="store_true",
+        help="Print all tables, columns, and row counts, then exit",
+    )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=0,
+        help="With --inspect, also print up to N sample rows per table",
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------- #
@@ -386,19 +493,40 @@ def main():
         db_path = extract_db(latest_pqb, temp_dir)
         print(f"Extracted DB → {db_path}")
 
+        # Inspect-only mode
+        if args.inspect:
+            inspect_schema(db_path, sample_rows=args.sample)
+            return
+
         # ------------------------------------------------------------------- #
         # 3. Query
         # ------------------------------------------------------------------- #
         cards = query_top_due(db_path, args.limit)
 
-        # ------------------------------------------------------------------- #
-        # 4. Output
-        # ------------------------------------------------------------------- #
+        # Identify missing fronts
+        missing_ids = [c["id"] for c in cards if not (c.get("front") or "").strip()]
+
+        # Output (pretty_print keeps them visible; sanitized sequence skips them)
         pretty_print(cards)
+        print(f"\nMissing fronts ({len(missing_ids)}): {missing_ids if missing_ids else 'None'}")
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_path = Path.cwd() / f"pleco_top{args.limit}_{timestamp}.csv"
         write_csv(cards, csv_path)
+
+        # Build worksheet sequence excluding missing
+        seq_parts = []
+        for c in cards:
+            raw_front = c.get('front', '')
+            cleaned = _clean_front(raw_front)
+            if raw_front and cleaned:
+                seq_parts.append(cleaned)
+        sequence = ''.join(seq_parts)
+        print(f"\nWorksheet sequence (for generator):\n{sequence}\n")
+
+        # Log file
+        log_path = Path.cwd() / f"pleco_top_due_log_{timestamp}.txt"
+        log_run(log_path, latest_pqb, db_path, cards, missing_ids, csv_path, sequence)
 
         # ------------------------------------------------------------------- #
         # 5. OPTIONAL: hand the words to your own CLI
@@ -414,7 +542,7 @@ def main():
                 sys.exit(1)
 
             # Build argument list: your_script.py word1 word2 word3 ...
-            words = [c["front"] for c in cards]
+            words = [ _clean_front(c["front"]) for c in cards if c.get("front") and _clean_front(c["front"]) ]
             import subprocess
 
             cmd = [sys.executable, str(cli_path)] + words
