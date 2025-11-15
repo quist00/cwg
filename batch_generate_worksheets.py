@@ -2,17 +2,22 @@ import csv
 import os
 import sys
 import subprocess
+import shutil
 from pathlib import Path
+from datetime import datetime
 
 # Configuration
 default_batch_size = 15
-data_dir = Path('backend/data')
+icloud_base = Path(r'D:\DaveApple\files\iCloudDrive')
+icloud_path = icloud_base / 'Mandarin' / 'worksheets'
+data_dir = icloud_path
 csv_glob = 'pleco_top*.csv'
 worksheet_prefix = 'worksheet_batch'
 
 
 def find_latest_csv():
-    files = sorted(data_dir.glob(csv_glob), key=os.path.getmtime, reverse=True)
+    csv_dir = Path('backend/data')
+    files = sorted(csv_dir.glob(csv_glob), key=os.path.getmtime, reverse=True)
     return files[0] if files else None
 
 
@@ -43,7 +48,8 @@ def batch_list(lst, batch_size):
 
 def generate_worksheet(batch, batch_num, guide=None):
     chars = ''.join(batch)
-    pdf_name = f'{worksheet_prefix}_{batch_num:02d}.pdf'
+    date_prefix = datetime.now().strftime('%Y%m%d')
+    pdf_name = f'{date_prefix}_{worksheet_prefix}_{batch_num:02d}.pdf'
     pdf_path = data_dir / pdf_name
     
     # gen.py requires --makemeahanzi and --cedict paths
@@ -62,7 +68,7 @@ def generate_worksheet(batch, batch_num, guide=None):
     # Move the generated sheet.pdf to the desired location
     generated_pdf = Path('sheet.pdf')
     if generated_pdf.exists():
-        generated_pdf.rename(pdf_path)
+        shutil.move(str(generated_pdf), str(pdf_path))
     else:
         print(f'Warning: sheet.pdf not found after generation')
 
