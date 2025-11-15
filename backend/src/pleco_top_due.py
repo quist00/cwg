@@ -25,6 +25,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 import re
+from typing import Any, Dict, List
 
 # --------------------------------------------------------------------------- #
 # CONFIGURATION
@@ -125,7 +126,22 @@ def extract_db(pqb_path: Path, temp_dir: Path) -> Path:
     )
 
 
-def query_top_due(db_path: Path, limit: int):
+def _clean_front(text: str) -> str:
+    if not text:
+        return ""
+    # Remove ASCII and fullwidth at signs plus incidental spaces
+    cleaned = (text
+               .replace('@', '')
+               .replace('＠', '')
+               .replace(' ', '')
+               )
+    # Wrap multi‑char strings in parentheses (avoid double)
+    if len(cleaned) > 1 and not (cleaned.startswith('(') and cleaned.endswith(')')):
+        cleaned = f'({cleaned})'
+    return cleaned
+
+
+def query_top_due(db_path: str, limit: int) -> List[Dict[str, Any]]:
     """
     Return a list of dicts:
         {'id': int, 'due': datetime|None, 'front': str, 'data': dict}
@@ -286,31 +302,44 @@ def query_top_due(db_path: Path, limit: int):
             "front": r.get("front", ""),
             "data": data_json,
         })
+    # Ensure dict keys include 'front' and a sortable 'due_sort'
+    for r in result:
+        if 'front' not in r:
+            r['front'] = ''
+        # unify due field
+        if 'due_sort' not in r and 'due' in r:
+            r['due_sort'] = r['due']
     return result
 
 
 def pretty_print(cards):
-    """Console table – easy to read."""
     print("\nTop due cards".center(60, "="))
     header = f"{'#':>3}  {'Due':19}  {'Front'}"
     print(header)
     print("-" * len(header))
-
     for i, c in enumerate(cards, 1):
         due_str = c["due"].strftime("%Y-%m-%d %H:%M") if c["due"] else "New"
-        print(f"{i:>3}  {due_str:19}  {c['front']}")
+        print(f"{i:>3}  {due_str:19}  {_clean_front(c['front'])}")
     print("=" * 60)
 
 
-def write_csv(cards, out_path: Path):
+def write_csv(cards: List[Dict[str, Any]], out_path: Path) -> None:
     """CSV with just the fields you probably need."""
-    with out_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["#", "Front", "Due"])
-        for i, c in enumerate(cards, 1):
-            due_str = c["due"].strftime("%Y-%m-%d %H:%M") if c["due"] else "New"
-            writer.writerow([i, c["front"], due_str])
+    import csv
+    with open(out_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['#', 'Front', 'Due'])
+        for idx, c in enumerate(cards, start=1):
+            front = _clean_front(c.get('front', ''))
+            due = c.get('due_sort') or c.get('due') or ''
+            w.writerow([idx, front, due])
     print(f"CSV written to: {out_path}")
+
+
+# Optional helper to print concatenated string for worksheet generator
+def print_compound_sequence(cards: List[Dict[str, Any]]) -> None:
+    seq = ''.join(_clean_front(c.get('front', '')) for c in cards)
+    print(f"\nWorksheet sequence:\n{seq}\n")
 
 
 def main():
